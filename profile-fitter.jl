@@ -140,30 +140,6 @@ function spanning_tree(edges, weights)
 end
 
 """
-    tree_root(points, edges)
-
-Returns the index of one of the farthermost points.
-"""
-function tree_root(points, edges)
-    dist = [typemax(Int) for _ in points]
-    dist[1] = 0
-    while true
-        changed = false
-        for e in edges
-            if dist[e[1]] < dist[e[2]] - 1
-                changed = true
-                dist[e[2]] = dist[e[1]] + 1
-            elseif dist[e[2]] < dist[e[1]] - 1
-                changed = true
-                dist[e[1]] = dist[e[2]] + 1
-            end
-        end
-        !changed && break
-    end
-    findmax(dist)[2]
-end
-
-"""
     thinning(points, edges, thickness)
 
 Given an Euclidean minimum spanning tree over a set of points taken from a (noisy) curve,
@@ -208,12 +184,11 @@ function thinning(points, edges, thickness)
         result
     end
 
-    ordered = bfs(tree_root(points, edges))
+    ordered = bfs(bfs(1)[end])
     thinned = []
     while !isempty(ordered)
         adjacent = neighbors(ordered[1])
-        mean = mapreduce(x -> points[x], +, adjacent) / length(adjacent)
-        push!(thinned, mean)
+        push!(thinned, mapreduce(x -> points[x], +, adjacent) / length(adjacent))
         setdiff!(ordered, adjacent)
     end
     thinned
