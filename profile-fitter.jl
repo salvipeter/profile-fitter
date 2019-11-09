@@ -178,16 +178,16 @@ function thinning(points, edges, thickness)
     end
 
     function bfs(start)
-        seen = Dict()
-        result = [start]
+        seen = Set()
+        result = []
         queue = [start]
         while !isempty(queue)
             v = popfirst!(queue)
             push!(result, v)
             for w in lookup[v]
-                if !haskey(seen, w)
+                if !(w in seen)
                     push!(queue, w)
-                    seen[w] = true
+                    push!(seen, w)
                 end
             end
         end
