@@ -1,8 +1,41 @@
 module ProFit
 
+## References ##
+
+# The general workflow is based on:
+#
+# P. Benkő, T. Várady:
+#   Best fit translational and rotational surfaces for reverse engineering shapes.
+#   In: The mathematics of surfaces IX, pp. 70-81, 2000.
+
+# The thinning algorithm for the guiding polygon is based on:
+#
+# I-K. Lee:
+#   Curve reconstruction from unorganized points.
+#   In: Computer Aided Geometric Design, Vol. 17(2), pp. 161-177, 2000.
+
+# Circle fitting is based on:
+#
+# S.J. Ahn, W. Rauh, H-J. Warnecke:
+#   Least-squares orthogonal distances fitting of circle, sphere, ellipse, hyperbola, and parabola.
+#   In: Pattern Recognition, Vol. 34(12), pp. 2283-2303, 2001.
+
+## TODO ##
+
+# Beautification:
+# - delete short arcs/segments
+# - unite similar arcs
+# - create segments from arcs with large radii
+# - ensure C0 continuity
+# - ensure G1 continuity where plausible
+
 using LinearAlgebra
 using Plots
 using Random
+
+
+
+# Delaunay triangulation
 
 """
     bounding_triangle(points)
@@ -40,7 +73,7 @@ function circumcircle(a, b, c)
         (b[1]^2 + b[2]^2) * (a[1] - c[1]) +
         (c[1]^2 + c[2]^2) * (b[1] - a[1])
     center = [x / d, y / d]
-    (center, norm(center - a))
+    center, norm(center - a)
 end
 
 """
@@ -108,6 +141,10 @@ function delaunay(points)
         all(x -> x <= n, tri)
     end
 end
+
+
+
+# Thinning
 
 """
     spanning_tree(edges, weights)
@@ -186,12 +223,14 @@ function thinning(points, edges, thickness)
 
     ordered = bfs(bfs(1)[end])
     thinned = []
+    chunks = []
     while !isempty(ordered)
         adjacent = neighbors(ordered[1])
         push!(thinned, mapreduce(x -> points[x], +, adjacent) / length(adjacent))
+        push!(chunks, adjacent)
         setdiff!(ordered, adjacent)
     end
-    thinned
+    thinned, chunks
 end
 
 """
@@ -211,6 +250,167 @@ end
 
 
 
+# Fitting
+
+"""
+    fit_line(X)
+
+Fits a least-squares line on the given points, and returns a `(point, normal)` pair,
+where `normal` is a unit vector perpendicular to the line.
+"""
+function fit_line(X)
+    centroid = sum(X) / length(X)
+    A = reduce(hcat, [p - centroid for p in X])
+    centroid, svd(A).U[:,2]
+end
+
+"""
+    line_error(X, line)
+
+Returns the squared sum of Euclidean distances to the line.
+"""
+function line_error(X, line)
+    p, n = line
+    sum(q -> dot(p - q, n)^2, X)
+end
+
+"""
+    line_cut(X, line)
+
+Cuts the segment relevant to the given points. Returns the endpoints.
+"""
+function line_cut(X, line)
+    p, n = line
+    project(q) = q + dot(p - q, n) * n
+    project(X[1]), project(X[end])
+end
+
+"""
+    fit_circle(X; tolerance, max_iteration, λ)
+
+Fits a least-squares circle on the given points. `X` is a list of 2D points.
+The iteration stops after the deviation between the last two approximation becomes
+less than `tolerance`, or if the the iteration count exceeds `max_iteration`.
+The step size for the Gauss-Newton iteration is given by `λ`.
+
+The return value is a `(radius, center)` tuple.
+"""
+function fit_circle(X; tolerance = 1.0e-7, max_iteration = 1000, λ = 1.3)
+    n = 2                       # dimension
+    m = length(X)
+    Xc = sum(X) / m
+    R = sqrt(sum(Xi -> norm(Xi - Xc)^2, X) / m)
+    a = vcat(R, Xc)
+    J = Array{Float64}(undef, n * m, n + 1)
+    rhs = Array{Float64}(undef, n * m)
+    for _ in 1:max_iteration
+        R = a[1]
+        Xc = a[2:end]
+        for i in 1:m
+            v = X[i] - Xc
+            d = norm(v)
+            J[(i-1)*n+1:i*n,1] = v / d
+            J[(i-1)*n+1:i*n,2:end] = I - R / d * (I - v * transpose(v) / d^2)
+            rhs[(i-1)*n+1:i*n] = v / d * (d - R)
+        end
+        Δa = J \ rhs
+        a += λ * Δa
+        norm(Δa) < tolerance && return a[1], a[2:end]
+    end
+    # @warn "Circle fitting exited with maximum iteration"
+    a[1], a[2:end]
+end
+
+"""
+    circle_error(X, circle)
+
+Returns the squared sum of Euclidean distances to the circle.
+"""
+function circle_error(X, circle)
+    r, p = circle
+    sum(q -> (norm(q - p) - r)^2, X)
+end
+
+"""
+    circle_cut(X, circle)
+
+Cuts the arc relevant to the given points. Returns the angles at the endpoints.
+"""
+function circle_cut(X, circle)
+    p = circle[2]
+    angle(q) = copysign(acos(normalize!(q - p)[1]), asin(normalize!(q - p)[2]))
+    dist(a, b) = b > a ? b - a : 2pi + b - a
+    from = angle(X[1])
+    mid = angle(X[(length(X)+1)÷2])
+    to = angle(X[end])
+    if dist(from, mid) > dist(from, to)
+        from, to = to, from
+    end
+    if to < from
+        to += 2pi
+    end
+    from, to
+end
+
+"""
+    fit_in_chunks(points, chunks, tolerance; seed_size)
+
+Fits circular arcs and line segments on the given unordered points, with the help
+of a guiding polygon.
+The function also needs a list of `chunks` - an ordered collection of index lists
+(the indices in each chunk are unordered, but the chunks progress through the curve).
+Curve segments are separated when the fitting error is above tolerance.
+All segment are assumed to consist of at least `seed_size` number of chunks.
+
+The result is a list of named tuples of the following form:
+  `(type=:arc, r=radius, p=center, min=minangle, max=maxangle)`
+or
+  `(type=:segment, a=start, b=end)`
+"""
+function fit_in_chunks(points, guide, chunks, tolerance; seed_size = 3)
+    function bestfit(a, b)
+        X = mapreduce(chunk -> points[chunk], append!, chunks[a:b])
+        line = fit_line(X)
+        circle = fit_circle(X)
+        le, ce = line_error(X, line), circle_error(X, circle)
+        if le < ce
+            a, b = line_cut(guide[a:b], line)
+            return le, (type=:segment, a=a, b=b)
+        end
+        a, b = circle_cut(guide[a:b], circle)
+        ce, (type=:arc, r=circle[1], p=circle[2], min=a, max=b)
+    end
+
+    length(chunks) < seed_size && return [bestfit(1, length(chunks))[2]]
+
+    local best
+    result = []
+    from = 1
+    i = 1
+    while i <= length(chunks) - seed_size + 1
+        next = bestfit(i, i + seed_size - 1)[1]
+        if from == i || next < best
+            best = next
+        elseif next - best > tolerance
+            push!(result, bestfit(from, i + seed_size - 2)[2])
+            from = i + seed_size - 2
+            i = from - 1
+        end
+        i += 1
+    end
+    push!(result, bestfit(from, length(chunks))[2])
+    result
+end
+
+function fit(points, thickness)
+    thinned, chunks = thinning(points, thickness)
+    fit_in_chunks(points, thinned, chunks, thickness / 2)
+end
+
+
+
+# Testing
+
 function test()
     noise = 1
     p = []
@@ -228,8 +428,8 @@ function test()
     end
     shuffle!(p)
 
-    scatter((x->x[1]).(p), (x->x[2]).(p), xlim=(-25,35), ylim=(-15,30),
-            markersize=2, markerstrokealpha=0.2, size=(1024,768), label="input")
+    plot1 = scatter((x->x[1]).(p), (x->x[2]).(p), xlim=(-25,35), ylim=(-15,30),
+                    markersize=2, markerstrokealpha=0.2, label="input")
 
     tris = delaunay(p)
     open("/tmp/tris.obj", "w") do f
@@ -253,8 +453,24 @@ function test()
         end
     end
 
-    result = thinning(p, tree, 2.0)
-    plot!((x->x[1]).(result), (x->x[2]).(result), linewidth=2, label="result")
+    thinned, chunks = thinning(p, tree, 2.0)
+    plot!((x->x[1]).(thinned), (x->x[2]).(thinned), linewidth=2, label="result")
+
+    result = fit_in_chunks(p, thinned, chunks, 1.0)
+    for r in result; println(r) end
+    plot2 = plot([], [], xlim=(-25,35), ylim=(-15,30), label="")
+    for (i, object) in enumerate(result)
+        samples = []
+        if object.type === :arc
+            samples = [object.p + [cos(x), sin(x)] * object.r
+                       for x in range(object.min, stop=object.max, length=100)]
+        elseif object.type === :segment
+            samples = [object.a, object.b]
+        end
+        plot!((x->x[1]).(samples), (x->x[2]).(samples), linewidth=2, label="")
+    end
+
+    plot(plot1, plot2, size=(720,1080), layout=(2,1))
 end
 
 end # module
