@@ -147,23 +147,23 @@ this function generates an ordered list of points representing a thinned version
 The `thickness` parameter should be around the same size as the noise.
 """
 function thinning(points, edges, thickness)
-    lookup = [[] for _ in points]
+    lookup = [Int[] for _ in points]
     for e in edges
         push!(lookup[e[1]], e[2])
         push!(lookup[e[2]], e[1])
     end
 
     function bfs(start)
-        seen = Set()
+        seen = fill(false, length(points))
         result = []
         queue = [start]
         while !isempty(queue)
             v = popfirst!(queue)
             push!(result, v)
             for w in lookup[v]
-                if !(w in seen)
+                if !seen[w]
                     push!(queue, w)
-                    push!(seen, w)
+                    seen[w] = true
                 end
             end
         end
